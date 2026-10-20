@@ -1,0 +1,158 @@
+name: Build and publish
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Upstream version X.Y.Z to (re)build and push. Leave empty to build every new upstream version."
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-and-publish
+  cancel-in-progress: false
+
+env:
+  # Oldest upstream version this repository builds.
+  MIN_VERSION: "0.163.1"
+  GHCR_IMAGE: ghcr.io/openobserve/otel-fleet-collector
+  ECR_IMAGE: public.ecr.aws/zinclabs/otel-fleet-collector
+  # ECR Public push is enabled by setting the repository variable AWS_ROLE_ARN.
+  ECR_ENABLED: ${{ vars.AWS_ROLE_ARN != '' }}
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+      actions: write # keepalive: re-enable this scheduled workflow
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Login to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Find versions to build
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          ready="$(.github/scripts/upstream-versions.sh "$MIN_VERSION")"
+          echo "Ready upstream versions (>= $MIN_VERSION):"; echo "${ready:-<none>}"
+          highest="$(tail -n1 <<<"$ready")"
+
+          exists() { docker buildx imagetools inspect "$1" >/dev/null 2>&1; }
+          published() {
+            exists "$GHCR_IMAGE:$1" || return 1
+            if [ "$ECR_ENABLED" = "true" ]; then exists "$ECR_IMAGE:$1" || return 1; fi
+          }
+
+          todo=()
+          if [ -n "$INPUT_VERSION" ]; then
+            if ! grep -qxF "$INPUT_VERSION" <<<"$ready"; then
+              echo "::error::Version '$INPUT_VERSION' is not a ready upstream version (both v$INPUT_VERSION and cmd/opampsupervisor/v$INPUT_VERSION with linux amd64/arm64 assets, >= $MIN_VERSION)."
+              exit 1
+            fi
+            todo=("$INPUT_VERSION")
+          else
+            while read -r v; do
+              [ -n "$v" ] || continue
+              if published "$v"; then echo "$v: already published, skipping"; else todo+=("$v"); fi
+            done <<<"$ready"
+          fi
+
+          matrix="$(printf '%s\n' "${todo[@]}" | jq -R -s -c --arg hi "$highest" \
+            'split("\n") | map(select(length > 0)) | map({version: ., latest: (. == $hi)})')"
+          echo "Build matrix: $matrix"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+      # GitHub disables scheduled workflows in public repos after 60 days without
+      # repository activity; re-enabling through the API keeps this one running.
+      - name: Keep schedule alive
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/build.yml/enable"
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.matrix != '[]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write # AWS OIDC for ECR Public
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Login to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure AWS credentials
+        if: env.ECR_ENABLED == 'true'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          aws-region: us-east-1
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-session-name: otel-fleet-collector
+
+      - name: Login to ECR Public
+        if: env.ECR_ENABLED == 'true'
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+        with:
+          registry-type: public
+
+      - name: Compute tags
+        id: tags
+        env:
+          VERSION: ${{ matrix.version }}
+          LATEST: ${{ matrix.latest }}
+        run: |
+          set -euo pipefail
+          images=("$GHCR_IMAGE")
+          [ "$ECR_ENABLED" = "true" ] && images+=("$ECR_IMAGE")
+          {
+            echo "list<<EOF"
+            for i in "${images[@]}"; do
+              echo "$i:$VERSION"
+              [ "$LATEST" = "true" ] && echo "$i:latest"
+            done
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # The Dockerfile verifies each download against its upstream .sha256 and
+      # fails the build on mismatch.
+      - name: Build and push ${{ matrix.version }}
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          build-args: VERSION=${{ matrix.version }}
+          tags: ${{ steps.tags.outputs.list }}
+          push: true
