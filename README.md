@@ -34,8 +34,8 @@ ghcr.io/openobserve/otel-fleet-collector:<version>
   collector are always the same upstream version.
 - `latest` points to the highest version built.
 - Images are built for `linux/amd64` and `linux/arm64`.
-- A [scheduled workflow](.github/workflows/build.yml) checks upstream every
-  6 hours. It builds a version once both release tags exist: `vX.Y.Z` and
+- A [scheduled workflow](.github/workflows/build.yml) checks upstream once a
+  day. It builds a version once both release tags exist: `vX.Y.Z` and
   `cmd/opampsupervisor/vX.Y.Z`.
 
 ## Run
